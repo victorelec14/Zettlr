@@ -26,75 +26,13 @@ import { ipcMain, app } from 'electron'
 import { DocumentTree, DTLeaf } from './document-tree'
 import PersistentDataContainer from '@common/modules/persistent-data-container'
 import { TabManager } from '@providers/documents/document-tree/tab-manager'
-import { DP_EVENTS, OpenDocument, DocumentType } from '@dts/common/documents'
+import { DP_EVENTS, OpenDocument } from '@dts/common/documents'
 import { v4 as uuid4 } from 'uuid'
 import chokidar from 'chokidar'
-import { Update } from '@codemirror/collab'
-import { ChangeSet, Text } from '@codemirror/state'
-import { CodeFileDescriptor, MDFileDescriptor } from '@dts/common/fsal'
 import countWords from '@common/util/count-words'
+import { DocumentAuthoritySingleton } from './document-authority'
 
 type DocumentWindows = Record<string, DocumentTree>
-
-const MAX_VERSION_HISTORY = 100 // Keep no more than this many updates.
-const DELAYED_SAVE_TIMEOUT = 5000 // Delayed timeout means: Save after 5 seconds
-const IMMEDIATE_SAVE_TIMEOUT = 250 // Even "immediate" should not save immediate to save disk space
-
-/**
- * Holds all information associated with a document that is currently loaded
- */
-interface Document {
-  /**
-   * The absolute path to the file
-   */
-  filePath: string
-  /**
-   * The descriptor for the file
-   */
-  descriptor: MDFileDescriptor|CodeFileDescriptor
-  /**
-   * The file type (e.g. Markdown, JSON, YAML)
-   */
-  type: DocumentType
-  /**
-   * The current version of the document in memory
-   */
-  currentVersion: number
-  /**
-   * The last version for which full updates are available. Editors with a
-   * version less than minimumVersion will need to reload the document.
-   */
-  minimumVersion: number
-  /**
-   * The last version number that has been saved to disk. If lastSavedVersion
-   * === currentVersion, the file is not modified.
-   */
-  lastSavedVersion: number
-  /**
-   * Holds all updates between minimumVersion and currentVersion in a granular
-   * form.
-   */
-  updates: Update[]
-  /**
-   * The actual document text in a CodeMirror format.
-   */
-  document: Text
-  /**
-   * Necessary for the word count statistics: The amount of words when the file
-   * was last saved to disk.
-   */
-  lastSavedWordCount: number
-  /**
-   * Necessary for the word count statistics: The amount of characters when the
-   * file was last saved to disk.
-   */
-  lastSavedCharCount: number
-  /**
-   * Holds an optional save timeout. This is for when users have indicated they
-   * want autosaving.
-   */
-  saveTimeout: undefined|NodeJS.Timeout
-}
 
 export default class DocumentManager extends ProviderContract {
   /**
@@ -140,13 +78,6 @@ export default class DocumentManager extends ProviderContract {
    */
   private readonly _remoteChangeDialogShownFor: string[]
 
-  /**
-   * This holds all currently opened documents somewhere across the app.
-   *
-   * @var {Document[]}
-   */
-  private readonly documents: Document[]
-
   private _shuttingDown: boolean
 
   constructor (private readonly _app: AppServiceContainer) {
@@ -159,7 +90,6 @@ export default class DocumentManager extends ProviderContract {
     this._config = new PersistentDataContainer(containerPath, 'yaml')
     this._ignoreChanges = []
     this._remoteChangeDialogShownFor = []
-    this.documents = []
     this._shuttingDown = false
 
     const options: chokidar.WatchOptions = {
@@ -212,13 +142,14 @@ export default class DocumentManager extends ProviderContract {
      * Hook the event listener that directly communicates with the editors
      */
     ipcMain.handle('documents-authority', async (event, { command, payload }) => {
+      const authority = DocumentAuthoritySingleton.getInstance()
       switch (command) {
         case 'pull-updates':
-          return await this.pullUpdates(payload.filePath, payload.version)
+          return await authority.pullUpdates(payload.filePath, payload.version)
         case 'push-updates':
-          return await this.pushUpdates(payload.filePath, payload.version, payload.updates)
+          return await authority.pushUpdates(payload.filePath, payload.version, payload.updates)
         case 'get-document':
-          return await this.getDocument(payload.filePath)
+          return await authority.getDocument(payload.filePath)
       }
     })
 
@@ -259,7 +190,8 @@ export default class DocumentManager extends ProviderContract {
           return
         }
         case 'get-file-modification-status': {
-          return this.documents.filter(x => this.isModified(x.filePath)).map(x => x.filePath)
+          const authority = DocumentAuthoritySingleton.getInstance()
+          return authority.getModifiedDocumentPaths()
         }
         case 'move-file': {
           const oWin = payload.originWindow
@@ -525,142 +457,6 @@ export default class DocumentManager extends ProviderContract {
     broadcastIpcMessage('documents-update', { event, context })
     this._emitter.emit(event, context)
   }
-
-  // DOCUMENT AUTHORITY FUNCTIONS
-
-  public async getDocument (filePath: string): Promise<{ content: string, type: DocumentType, startVersion: number }> {
-    const existingDocument = this.documents.find(doc => doc.filePath === filePath)
-    if (existingDocument !== undefined) {
-      return {
-        content: existingDocument.document.toString(),
-        type: existingDocument.type,
-        startVersion: existingDocument.currentVersion
-      }
-    }
-
-    let type = DocumentType.Markdown
-
-    // TODO: We also need to be able to load files not present in the file tree!
-    const descriptor = await this._app.fsal.getDescriptorForAnySupportedFile(filePath)
-    if (descriptor === undefined || descriptor.type === 'other') {
-      throw new Error(`Cannot load file ${filePath}`) // TODO: Proper error handling & state recovery!
-    }
-
-    const content = await this._app.fsal.loadAnySupportedFile(filePath)
-
-    if (descriptor.type === 'code') {
-      switch (descriptor.ext) {
-        case '.yaml':
-        case '.yml':
-          type = DocumentType.YAML
-          break
-        case '.json':
-          type = DocumentType.JSON
-          break
-        case '.tex':
-        case '.latex':
-          type = DocumentType.LaTeX
-      }
-    }
-
-    const doc: Document = {
-      filePath,
-      type,
-      descriptor,
-      currentVersion: 0,
-      minimumVersion: 0,
-      lastSavedVersion: 0,
-      updates: [],
-      document: Text.of(content.split(descriptor.linefeed)),
-      lastSavedWordCount: countWords(content, false),
-      lastSavedCharCount: countWords(content, true),
-      saveTimeout: undefined
-    }
-
-    this.documents.push(doc)
-    this.syncWatchedFilePaths()
-
-    return { content, type, startVersion: 0 }
-  }
-
-  private async pullUpdates (filePath: string, clientVersion: number): Promise<Update[]|false> {
-    const doc = this.documents.find(doc => doc.filePath === filePath)
-    if (doc === undefined) {
-      // Indicate to the editor that they should get the document (again). This
-      // handles the case where the document has been remotely modified and thus
-      // removed from the document array.
-      return false
-    }
-
-    if (clientVersion < doc.minimumVersion) {
-      // TODO: This means that the client is completely out of sync and needs to
-      // re-fetch the whole document.
-      return false
-    } else if (clientVersion < doc.currentVersion) {
-      return doc.updates.slice(clientVersion - doc.minimumVersion)
-    } else {
-      return [] // No updates available
-    }
-  }
-
-  private async pushUpdates (filePath: string, clientVersion: number, clientUpdates: any[]): Promise<boolean> { // clientUpdates must be produced via "toJSON"
-    const doc = this.documents.find(doc => doc.filePath === filePath)
-    if (doc === undefined) {
-      throw new Error(`Could not receive updates for file ${filePath}: Not found.`)
-    }
-
-    if (clientVersion !== doc.currentVersion) {
-      return false
-    }
-
-    for (const update of clientUpdates) {
-      const changes = ChangeSet.fromJSON(update.changes)
-      doc.updates.push(update)
-      doc.document = changes.apply(doc.document)
-      doc.currentVersion = doc.minimumVersion + doc.updates.length
-      // People are lazy, and hence there is a non-zero chance that in a few
-      // instances the currentVersion will get dangerously close to
-      // Number.MAX_SAFE_INTEGER. In that case, we need to perform a rollback to
-      // version 0 and notify all editors that have the document in question
-      // open to simply re-load it. That will cause a screen-flicker, but
-      // honestly better like this than otherwise.
-      if (doc.currentVersion === Number.MAX_SAFE_INTEGER - 1) {
-        console.warn(`Document ${filePath} has reached MAX_SAFE_INTEGER. Performing rollback ...`)
-        doc.minimumVersion = 0
-        doc.currentVersion = doc.updates.length
-        // TODO: Broadcast a message so that all editor instances can reload the
-        // document.
-      }
-    }
-
-    // Notify all clients, they will then request the update
-    this.broadcastEvent(DP_EVENTS.CHANGE_FILE_STATUS, { filePath, status: 'modification' })
-
-    // Drop all updates that exceed the amount of updates we allow.
-    while (doc.updates.length > MAX_VERSION_HISTORY) {
-      doc.updates.shift()
-      doc.minimumVersion++
-    }
-
-    clearTimeout(doc.saveTimeout)
-    const autoSave = this._app.config.get().editor.autoSave
-
-    // No autosave
-    if (autoSave === 'off') {
-      return true
-    }
-
-    const timeout = autoSave === 'delayed' ? DELAYED_SAVE_TIMEOUT : IMMEDIATE_SAVE_TIMEOUT
-
-    doc.saveTimeout = setTimeout(() => {
-      this.saveFile(doc.filePath)
-        .catch(err => this._app.log.error(`[Document Provider] Could not save file ${doc.filePath}: ${err.message as string}`, err))
-    }, timeout)
-
-    return true
-  }
-
-  // END DOCUMENT AUTHORITY FUNCTIONS
 
   /**
    * This function searches all currently opened documents for files that have
