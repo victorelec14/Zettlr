@@ -34,6 +34,7 @@ import { ChangeSet, Text } from '@codemirror/state'
 import type { CodeFileDescriptor, MDFileDescriptor } from '@dts/common/fsal'
 import { countChars, countWords } from '@common/util/counter'
 import { markdownToAST } from '@common/modules/markdown-utils'
+import { DocumentAuthoritySingleton } from './document-authority'
 
 type DocumentWindows = Record<string, DocumentTree>
 
@@ -73,16 +74,6 @@ export default class DocumentManager extends ProviderContract {
    */
   private readonly _ignoreChanges: string[]
 
-  /**
-   * This array allows us to prevent showing multiple "Reload changes?" dialogs
-   * for a single file open in the app.
-   *
-   * @var {string[]}
-   */
-  private readonly _remoteChangeDialogShownFor: string[]
-
-  private _shuttingDown: boolean
-
   constructor (private readonly _app: AppServiceContainer) {
     super()
 
@@ -93,7 +84,6 @@ export default class DocumentManager extends ProviderContract {
     this._config = new PersistentDataContainer(containerPath, 'yaml')
     this._ignoreChanges = []
     this._remoteChangeDialogShownFor = []
-    this._shuttingDown = false
 
     const options: chokidar.WatchOptions = {
       persistent: true,
@@ -145,7 +135,7 @@ export default class DocumentManager extends ProviderContract {
      * Hook the event listener that directly communicates with the editors
      */
     ipcMain.handle('documents-authority', async (event, { command, payload }) => {
-      const authority = DocumentAuthoritySingleton.getInstance()
+      const authority = this.documentAuthority
       switch (command) {
         case 'pull-updates':
           return await authority.pullUpdates(payload.filePath, payload.version)
@@ -193,8 +183,7 @@ export default class DocumentManager extends ProviderContract {
           return
         }
         case 'get-file-modification-status': {
-          const authority = DocumentAuthoritySingleton.getInstance()
-          return authority.getModifiedDocumentPaths()
+          return this.documentAuthority.getModifiedDocumentPaths()
         }
         case 'move-file': {
           const oWin = payload.originWindow
@@ -239,44 +228,7 @@ export default class DocumentManager extends ProviderContract {
         }
       }
     })
-
-    // Listen to the before-quit event by which we make sure to only quit the
-    // application if the status of possibly modified files has been cleared.
-    // We listen to this event, because it will fire *before* the process
-    // attempts to close the open windows, including the main window, which
-    // would result in a loss of data. NOTE: The exception is the auto-updater
-    // which will close the windows before this event. But because we also
-    // listen to close-events on the main window, we should be able to handle
-    // this, if we ever switched to the auto updater.
-    app.on('before-quit', (event) => {
-      if (!this.isClean()) {
-        event.preventDefault()
-
-        this._app.windows.askSaveChanges()
-          .then(async result => {
-            // 0 = Save, 1 = Don't save, 2 = Cancel
-            if (result.response < 2) {
-              for (const document of this.documents) {
-                if (result.response === 1) {
-                  document.lastSavedVersion = document.currentVersion
-                } else {
-                  await this.saveFile(document.filePath)
-                }
-              }
-
-              // TODO: Emit events that the documents are now clean, same below
-
-              app.quit()
-            } // Else: Don't quit
-          })
-          .catch(err => {
-            this._app.log.error('[DocumentManager] Cannot ask user to save or omit changes!', err)
-          })
-      } else {
-        this._shuttingDown = true
-      }
-    })
-  } // END constructor
+  }
 
   /**
    * Use this method to ask the user whether or not the window identified with
@@ -288,52 +240,18 @@ export default class DocumentManager extends ProviderContract {
    * @return  {Promise<boolean>}            Returns false if the window may not be closed
    */
   public async askUserToCloseWindow (windowId: string): Promise<boolean> {
-    if (this.isClean(windowId)) {
-      return true
-    }
-
-    // TODO: Check if the same (modified) files are also open in other windows.
-    // If so, we can treat this window as if it contains no changes, since the
-    // document is still open somewhere else.
-
-    const result = await this._app.windows.askSaveChanges()
-    // 0 = Save, 1 = Don't save, 2 = Cancel
-    if (result.response === 1) {
-      // Mark everything as clean TODO: As of now this would mean that if the
-      // documents are open in other windows, they would still reflect the
-      // "wrong" (b/c omitted, unsaved) state!
-      for (const document of this.documents) {
-        document.lastSavedVersion = document.currentVersion
-      }
-
-      // If we're not shutting down, this function will only be called for when
-      // the user wants to actively close a window for good
-      if (!this._shuttingDown) {
-        this.closeWindow(windowId)
-      }
-
-      return true
-    } else if (result.response === 0) {
-      // Save all docs
-      for (const document of this.documents) {
-        await this.saveFile(document.filePath)
-      }
-
-      // If we're not shutting down, this function will only be called for when
-      // the user wants to actively close a window for good
-      if (!this._shuttingDown) {
-        this.closeWindow(windowId)
-      }
-
-      return true
-    } else {
-      return false
-    }
+    return true
   }
 
   async boot (): Promise<void> {
     // Loads in all openFiles
     this._app.log.verbose('Document Manager starting up ...')
+
+    // Ensure the document authority is ready as soon as clients begin
+    // requesting files. NOTE: For this it suffices to just access it.
+    this.documentAuthority.on('onBeforeUnlinkFile', (filePath: string) => {
+      this.closeFileEverywhere(filePath)
+    })
 
     // Check if the data store is initialized
     if (!await this._config.isInitialized()) {
@@ -613,8 +531,8 @@ export default class DocumentManager extends ProviderContract {
   /**
    * Directs every open leaf to close a given file. This function even
    * overwrites potential stati such as modification or pinned to ensure files
-   * are definitely closed. This will be called from within the watcher callback
-   * on an `unlink` event.
+   * are definitely closed. Call this function if a file has been removed from
+   * disk.
    *
    * @param   {string}  filePath  The file path in question
    */
@@ -629,65 +547,6 @@ export default class DocumentManager extends ProviderContract {
             this.broadcastEvent(DP_EVENTS.CLOSE_FILE, { windowId: key, leafId: leaf.id, filePath })
           }
         }
-      }
-    }
-
-    this.syncWatchedFilePaths()
-  }
-
-  /**
-   * This function handles a remote change, i.e. where the watcher has reported
-   * that the file has been changed remotely.
-   *
-   * @param   {string}  filePath  The file in question
-   */
-  private async handleRemoteChange (filePath: string): Promise<void> {
-    // First thing we have to look up is: Did the file really change? Then, we
-    // have to update the file descriptors across all leafs and broadcast an event.
-    const openFiles: OpenDocument[] = []
-    for (const key in this._windows) {
-      const allLeafs = this._windows[key].getAllLeafs()
-      for (const leaf of allLeafs) {
-        openFiles.push(...leaf.tabMan.openFiles.filter(x => x.path === filePath))
-      }
-    }
-
-    const doc = this.documents.find(doc => doc.filePath === filePath)
-
-    if (doc === undefined) {
-      throw new Error(`Could not handle remote change for file ${filePath}: Could not find corresponding file!`)
-    }
-
-    const stat = await fs.lstat(filePath)
-    const modtime = stat.mtime.getTime()
-    const ourModtime = doc.descriptor.modtime
-    // In response to issue #1621: We will not check for equal modtime but only
-    // for newer modtime to prevent sluggish cloud synchronization services
-    // (e.g. OneDrive and Box) from having text appear to "jump" from time to time.
-    if (modtime > ourModtime) {
-      // Notify the caller, that the file has actually changed on disk.
-      // The contents of one of the open files have changed.
-      // What follows looks a bit ugly, welcome to callback hell.
-      if (this._app.config.get('alwaysReloadFiles') === true) {
-        await this.notifyRemoteChange(filePath)
-      } else {
-        // Prevent multiple instances of the dialog, just ask once. The logic
-        // always retrieves the most recent version either way
-        if (this._remoteChangeDialogShownFor.includes(filePath)) {
-          return
-        }
-        this._remoteChangeDialogShownFor.push(filePath)
-
-        // Ask the user if we should replace the file
-        const shouldReplace = await this._app.windows.shouldReplaceFile(filePath)
-        // In any case remove the isShownFor for this file.
-        this._remoteChangeDialogShownFor.splice(this._remoteChangeDialogShownFor.indexOf(filePath), 1)
-        if (!shouldReplace) {
-          this.broadcastEvent(DP_EVENTS.CHANGE_FILE_STATUS, { filePath, status: 'modification' })
-          return
-        }
-
-        await this.notifyRemoteChange(filePath)
       }
     }
   }
@@ -751,6 +610,22 @@ export default class DocumentManager extends ProviderContract {
   }
 
   /**
+   * Returns all open files
+   *
+   * @return  {string[]}  An array of absolute file paths
+   */
+  public getOpenFiles (): string[] {
+    const openFiles: string[] = []
+    for (const windowId in this._windows) {
+      for (const leaf of this._windows[windowId].getAllLeafs()) {
+        openFiles.push(...leaf.tabMan.openFiles.map(f => f.path))
+      }
+    }
+
+    return [...new Set(openFiles)] // Remove duplicates
+  }
+
+  /**
    * This function ensures that our watcher keeps watching the correct files
    */
   private syncWatchedFilePaths (): void {
@@ -763,16 +638,7 @@ export default class DocumentManager extends ProviderContract {
       }
     }
 
-    // Second, get all open files. NOTE: This does not mean "open open", but
-    // rather paths that are "open" somewhere in a leaf. Not actively viewed.
-    let openFiles: string[] = []
-    for (const windowId in this._windows) {
-      for (const leaf of this._windows[windowId].getAllLeafs()) {
-        openFiles.push(...leaf.tabMan.openFiles.map(f => f.path))
-      }
-    }
-
-    openFiles = [...new Set(openFiles)] // Remove duplicates
+    const openFiles = this.getOpenFiles()
 
     // Third, remove those watched files which are no longer open
     for (const watchedFile of watchedFiles) {
@@ -1016,12 +882,16 @@ export default class DocumentManager extends ProviderContract {
   }
 
   public isModified (filePath: string): boolean {
-    const doc = this.documents.find(doc => doc.filePath === filePath)
-    if (doc !== undefined) {
-      return doc.currentVersion !== doc.lastSavedVersion
-    } else {
-      return false // None existing files aren't modified
-    }
+    return this.documentAuthority.isModified(filePath)
+  }
+
+  /**
+   * Retrieves the document authority singleton
+   *
+   * @return  {DocumentAuthoritySingleton}  The singleton
+   */
+  private get documentAuthority (): DocumentAuthoritySingleton {
+    return DocumentAuthoritySingleton.getInstance(this._app.fsal)
   }
 
   /**
@@ -1033,7 +903,7 @@ export default class DocumentManager extends ProviderContract {
    *                                  clean state.
    */
   public isClean (id?: string, which?: 'window'|'leaf'): boolean {
-    const modPaths = this.documents.filter(x => this.isModified(x.filePath)).map(x => x.filePath)
+    const modPaths = this.documentAuthority.getModifiedDocumentPaths()
 
     if (id === undefined) {
       // Total clean state

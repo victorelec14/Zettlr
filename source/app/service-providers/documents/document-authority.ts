@@ -1,7 +1,44 @@
 import { DP_EVENTS, DocumentType } from '@dts/common/documents'
-import { CodeFileDescriptor, MDFileDescriptor } from '@dts/common/fsal'
 import { Update } from '@codemirror/collab'
 import { Text } from '@codemirror/state'
+// import { promises as fs } from 'fs'
+import type FSAL from '@providers/fsal'
+import path from 'path'
+import { hasCodeExt, hasMarkdownExt } from '@providers/fsal/util/is-md-or-code-file'
+import { countChars, countWords } from '@common/util/counter'
+import { markdownToAST } from '@common/modules/markdown-utils'
+import chokidar from 'chokidar'
+import { EventEmitter } from 'events'
+import { promises as fs } from 'fs'
+import { type MessageBoxOptions, dialog } from 'electron'
+import { trans } from '@common/i18n-main'
+
+async function getModtimeFor (filePath: string): Promise<number> {
+  const stat = await fs.lstat(filePath)
+  return stat.mtime.getTime()
+}
+
+async function replaceFile (filename: string, alwaysReloadFilesChecked: boolean): Promise<boolean> {
+  const options: MessageBoxOptions = {
+    type: 'question',
+    title: trans('Replace file'),
+    message: trans('File %s has been modified remotely. Replace the loaded version with the newer one from disk?', filename),
+    checkboxLabel: trans('Always load remote changes to the current file'),
+    checkboxChecked: alwaysReloadFilesChecked,
+    buttons: [
+      trans('Cancel'),
+      trans('Ok')
+    ],
+    cancelId: 0,
+    defaultId: 1
+  }
+
+  const response = await dialog.showMessageBox(options)
+
+  // TODO: config.set('alwaysReloadFiles', response.checkboxChecked)
+
+  return response.response === 1
+}
 
 /**
  * Holds all information associated with a document that is currently loaded
@@ -11,10 +48,6 @@ interface Document {
    * The absolute path to the file
    */
   filePath: string
-  /**
-   * The descriptor for the file
-   */
-  descriptor: MDFileDescriptor|CodeFileDescriptor
   /**
    * The file type (e.g. Markdown, JSON, YAML)
    */
@@ -33,6 +66,10 @@ interface Document {
    * === currentVersion, the file is not modified.
    */
   lastSavedVersion: number
+  /**
+   * Saves the mod time for the file on disk
+   */
+  modtime: number
   /**
    * Holds all updates between minimumVersion and currentVersion in a granular
    * form.
@@ -59,11 +96,15 @@ interface Document {
   saveTimeout: undefined|NodeJS.Timeout
 }
 
-export class DocumentAuthoritySingleton {
+export class DocumentAuthoritySingleton extends EventEmitter {
   private static instance: DocumentAuthoritySingleton
   private readonly MAX_VERSION_HISTORY = 100 // Keep no more than this many updates.
   private readonly DELAYED_SAVE_TIMEOUT = 5000 // Delayed timeout means: Save after 5 seconds
-  private readonly IMMEDIATE_SAVE_TIMEOUT = 250 // Even "immediate" should not save immediate to save disk space
+  private readonly IMMEDIATE_SAVE_TIMEOUT = 500 // Immediate = half a second
+  private readonly watcher: chokidar.FSWatcher
+  private readonly ignoreChanges: string[] = []
+  private alwaysReloadFiles = false
+  private readonly remoteChangeDialogShownFor: string[] = []
 
   /**
    * This holds all currently opened documents somewhere across the app.
@@ -72,13 +113,99 @@ export class DocumentAuthoritySingleton {
    */
   private readonly documents: Document[] = []
 
-  private constructor () {}
+  private constructor (private readonly fsal: FSAL) {
+    super()
+    const options: chokidar.WatchOptions = {
+      persistent: true,
+      ignoreInitial: true, // Do not track the initial watch as changes
+      followSymlinks: true, // Follow symlinks
+      ignorePermissionErrors: true, // In the worst case one has to reboot the software, but so it looks nicer.
+      // See the description for the next vars in the fsal-watchdog.ts
+      interval: 5000,
+      binaryInterval: 5000
+    }
 
-  public static getInstance (): DocumentAuthoritySingleton {
+    // Start up the chokidar process
+    this.watcher = new chokidar.FSWatcher(options)
+
+    this.watcher.on('all', (event: string, filePath: string) => {
+      if (this.ignoreChanges.includes(filePath)) {
+        this.ignoreChanges.splice(this.ignoreChanges.indexOf(filePath), 1)
+        return
+      }
+
+      if (event === 'unlink') {
+        // Close the file everywhere
+        this.onUnlinkFile(filePath)
+      } else if (event === 'change') {
+        this.onChangeFile(filePath)
+      }
+    })
+  }
+
+  public async shutdown (): Promise<void> {
+    // TODO: Check if modified files, ask for saving
+  }
+
+  public static getInstance (fsal: FSAL): DocumentAuthoritySingleton {
     if (DocumentAuthoritySingleton.instance === undefined) {
-      DocumentAuthoritySingleton.instance = new DocumentAuthoritySingleton()
+      DocumentAuthoritySingleton.instance = new DocumentAuthoritySingleton(fsal)
     }
     return DocumentAuthoritySingleton.instance
+  }
+
+  public setAlwaysReloadFiles (alwaysReload: boolean): void {
+    this.alwaysReloadFiles = alwaysReload
+  }
+
+  private onUnlinkFile (filePath: string): void {
+    this.emit('onBeforeUnlinkFile', filePath)
+    const idx = this.documents.findIndex(doc => doc.filePath === filePath)
+    if (idx > -1) {
+      this.documents.splice(idx, 1)
+    }
+
+    this.syncWatchedFilePaths()
+  }
+
+  private async onChangeFile (filePath: string): Promise<void> {
+    const doc = this.documents.find(doc => doc.filePath === filePath)
+
+    if (doc === undefined) {
+      throw new Error(`Could not handle remote change for file ${filePath}: Could not find corresponding file!`)
+    }
+
+    const modtime = await getModtimeFor(filePath)
+    const ourModtime = doc.modtime
+    // In response to issue #1621: We will not check for equal modtime but only
+    // for newer modtime to prevent sluggish cloud synchronization services
+    // (e.g. OneDrive and Box) from having text appear to "jump" from time to time.
+    if (modtime > ourModtime) {
+      // Notify the caller, that the file has actually changed on disk.
+      // The contents of one of the open files have changed.
+      // What follows looks a bit ugly, welcome to callback hell.
+      if (this.alwaysReloadFiles) {
+        await this.notifyRemoteChange(filePath)
+      } else {
+        // Prevent multiple instances of the dialog, just ask once. The logic
+        // always retrieves the most recent version either way
+        if (this.remoteChangeDialogShownFor.includes(filePath)) {
+          return
+        }
+        this.remoteChangeDialogShownFor.push(filePath)
+
+        // Ask the user if we should replace the file
+        const shouldReplace = await replaceFile(path.basename(filePath), this.alwaysReloadFiles)
+        // In any case remove the isShownFor for this file.
+        this.remoteChangeDialogShownFor.splice(this.remoteChangeDialogShownFor.indexOf(filePath), 1)
+        if (!shouldReplace) {
+          this.broadcastEvent(DP_EVENTS.CHANGE_FILE_STATUS, { filePath, status: 'modification' })
+          return
+        }
+
+        await this.notifyRemoteChange(filePath)
+      }
+    }
   }
 
   public async getDocument (filePath: string): Promise<{ content: string, type: DocumentType, startVersion: number }> {
@@ -91,17 +218,12 @@ export class DocumentAuthoritySingleton {
       }
     }
 
-    let type = DocumentType.Markdown
+    let type: DocumentType | undefined
 
-    const descriptor = await this._app.fsal.getDescriptorForAnySupportedFile(filePath)
-    if (descriptor === undefined || descriptor.type === 'other') {
-      throw new Error(`Cannot load file ${filePath}`) // TODO: Proper error handling & state recovery!
-    }
+    const content = await this.fsal.loadAnySupportedFile(filePath)
 
-    const content = await this._app.fsal.loadAnySupportedFile(filePath)
-
-    if (descriptor.type === 'code') {
-      switch (descriptor.ext) {
+    if (hasCodeExt(filePath)) {
+      switch (path.extname(filePath)) {
         case '.yaml':
         case '.yml':
           type = DocumentType.YAML
@@ -113,19 +235,27 @@ export class DocumentAuthoritySingleton {
         case '.latex':
           type = DocumentType.LaTeX
       }
+    } else if (hasMarkdownExt(filePath)) {
+      type = DocumentType.Markdown
     }
+
+    if (type === undefined) {
+      throw new Error(`Could not load document ${filePath}: Unknown document type.`)
+    }
+
+    const ast = markdownToAST(content)
 
     const doc: Document = {
       filePath,
       type,
-      descriptor,
       currentVersion: 0,
       minimumVersion: 0,
       lastSavedVersion: 0,
       updates: [],
-      document: Text.of(content.split(descriptor.linefeed)),
-      lastSavedWordCount: countWords(content, false),
-      lastSavedCharCount: countWords(content, true),
+      document: Text.of(content.split(/\r\n|\n\r|\n/g)),
+      lastSavedWordCount: countWords(ast),
+      lastSavedCharCount: countChars(ast),
+      modtime: await getModtimeFor(filePath),
       saveTimeout: undefined
     }
 
@@ -210,6 +340,37 @@ export class DocumentAuthoritySingleton {
     }, timeout)
 
     return true
+  }
+
+  /**
+   * This function ensures that our watcher keeps watching the correct files
+   */
+  private syncWatchedFilePaths (): void {
+    // First, get the files currently watched
+    const watchedFiles: string[] = []
+    const watched = this.watcher.getWatched()
+    for (const dir in watched) {
+      for (const filename of watched[dir]) {
+        watchedFiles.push(path.join(dir, filename))
+      }
+    }
+
+    // Second, all documents currently loaded
+    const openFiles = this.documents.map(doc => doc.filePath)
+
+    // Third, remove those watched files which are no longer open
+    for (const watchedFile of watchedFiles) {
+      if (!openFiles.includes(watchedFile)) {
+        this.watcher.unwatch(watchedFile)
+      }
+    }
+
+    // Fourth, add those open files not yet watched
+    for (const openFile of openFiles) {
+      if (!watchedFiles.includes(openFile)) {
+        this.watcher.add(openFile)
+      }
+    }
   }
 
   // MODIFICATION
