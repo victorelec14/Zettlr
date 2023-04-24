@@ -45,8 +45,6 @@ import RelatedFilesTab from './RelatedFilesTab.vue'
 import OtherFilesTab from './OtherFilesTab.vue'
 import { OpenDocument } from '@dts/common/documents'
 
-const ipcRenderer = window.ipc
-
 export default defineComponent({
   name: 'MainSidebar',
   components: {
@@ -111,29 +109,6 @@ export default defineComponent({
       return this.$store.state.modifiedDocuments
     }
   },
-  watch: {
-    // TODO: MOVE THIS TO THE STORE
-    modifiedFiles: function () {
-      if (this.activeFile == null) {
-        return
-      }
-
-      // Update the related files when the current document is not modified to
-      // immediately account for any changes in the related files.
-      const activePath = this.activeFile.path
-      if (!(activePath in this.modifiedFiles)) {
-        this.$store.dispatch('updateRelatedFiles')
-          .catch(e => console.error('Could not update related files', e))
-      }
-    }
-  },
-  mounted: function () {
-    // TODO: MOVE THIS TO THE STORE
-    ipcRenderer.on('links', () => {
-      this.$store.dispatch('updateRelatedFiles')
-        .catch(e => console.error('Could not update related files', e))
-    })
-  },
   methods: {
     setCurrentTab: function (which: string) {
       (global as any).config.set('window.currentSidebarTab', which)
@@ -156,11 +131,7 @@ body {
     overflow: hidden;
 
     #sidebar-tab-container {
-      position: absolute;
       top: 40px;
-      bottom: 0;
-      left: 0px;
-      right: 0px;
       padding: 0px 5px 5px 0px;
       overflow-y: auto;
     }

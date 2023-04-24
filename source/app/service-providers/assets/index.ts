@@ -19,8 +19,8 @@ import { promises as fs } from 'fs'
 import YAML from 'yaml'
 import broadcastIpcMessage from '@common/util/broadcast-ipc-message'
 import ProviderContract from '../provider-contract'
-import LogProvider from '../log'
-import { PandocProfileMetadata } from '@dts/common/assets'
+import type LogProvider from '../log'
+import { type PandocProfileMetadata } from '@dts/common/assets'
 import { getCustomProfiles } from '@providers/commands/exporter'
 import getPlainPandocReaderWriter from '@common/util/plain-pandoc-reader-writer'
 import { SUPPORTED_READERS } from '@common/util/pandoc-maps'
@@ -298,6 +298,13 @@ export default class AssetsProvider extends ProviderContract {
         })
       } catch (err) {
         this._logger.warning(`[Assets Provider] Installed profile ${file} had an error and could not be parsed`)
+        profiles.push({
+          name: file,
+          writer: '',
+          reader: '',
+          isInvalid: true,
+          isProtected: this._protectedDefaults.includes(file)
+        })
       }
     }
 

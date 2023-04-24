@@ -8,21 +8,24 @@
   >
     <!-- We have a leaf: Default DocumentTabs/Editor combo -->
     <DocumentTabs
+      v-show="!distractionFree"
       v-bind:leaf-id="leafId"
       v-bind:window-id="windowId"
     ></DocumentTabs>
-    <MainEditor
-      v-if="activeFile !== null"
-      ref="editor"
-      v-bind:distraction-free="distractionFree"
-      v-bind:leaf-id="leafId"
-      v-bind:window-id="windowId"
-      v-bind:editor-commands="editorCommands"
-      v-on:global-search="$emit('globalSearch', $event)"
-    ></MainEditor>
-    <div v-else class="empty-pane"></div>
+    <template v-for="file in openFiles" v-bind:key="file.path">
+      <MainEditor
+        v-show="activeFile?.path === file.path"
+        v-bind:file="file"
+        v-bind:distraction-free="distractionFree"
+        v-bind:leaf-id="leafId"
+        v-bind:active-file="activeFile"
+        v-bind:window-id="windowId"
+        v-bind:editor-commands="editorCommands"
+        v-on:global-search="$emit('globalSearch', $event)"
+      ></MainEditor>
+    </template>
+    <div v-if="hasNoOpenFiles" class="empty-pane"></div>
   </div>
-  <!-- A single editor pane can either be a pane itself OR a MultiSplitView -->
 </template>
 
 <script lang="ts">
@@ -80,6 +83,12 @@ export default defineComponent({
     },
     activeFile (): OpenDocument|null {
       return this.node?.activeFile ?? null
+    },
+    openFiles (): OpenDocument[] {
+      return this.node?.openFiles ?? []
+    },
+    hasNoOpenFiles (): boolean {
+      return this.openFiles.length === 0
     }
   }
 })
@@ -87,26 +96,27 @@ export default defineComponent({
 
 <style lang="less">
 body {
-  .split-pane-container {
-    .editor-pane {
-      // Styles for the editor pane
-      flex-grow: 1;
+  .editor-pane {
+    // Styles for the editor pane
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+
+    .empty-pane {
+      width: 100%;
+      height: 100%;
+      // If the editor is empty, display a nice background image
+      background-position: center center;
+      background-size: contain;
+      background-repeat: no-repeat;
+      background-image: url(../common/img/logo.svg);
+      background-color: white;
+      padding-top: 5em;
     }
   }
 
-  .editor-pane .empty-pane {
-    position: absolute;
-    top: 30px; // Space for the document tabbar
-    bottom: 0;
-    left: 0;
-    right: 0;
-    // If the editor is empty, display a nice background image
-    background-position: center center;
-    background-size: contain;
-    background-repeat: no-repeat;
-    background-color: inherit;
-    background-image: url(../common/img/logo.svg);
-    padding-top: 5em;
+  &.dark .editor-pane .empty-pane {
+    background-color: rgb(40, 40, 40);
   }
 }
 </style>

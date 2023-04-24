@@ -20,7 +20,7 @@ export default function (): any {
       [
         {
           type: 'select',
-          label: trans('Application language (<strong>Restart required!</strong>)'),
+          label: trans('Application language'),
           model: 'appLang',
           options: {} // Will be set dynamically
         }
@@ -96,7 +96,8 @@ export default function (): any {
         {
           type: 'checkbox',
           label: trans('Display Markdown file extensions'),
-          model: 'display.markdownFileExtensions'
+          model: 'display.markdownFileExtensions',
+          disabled: window.config.get('fileNameDisplay') !== 'filename'
         }
       ],
       [

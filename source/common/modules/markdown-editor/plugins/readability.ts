@@ -13,7 +13,13 @@
  * END HEADER
  */
 
-import { ViewUpdate, ViewPlugin, DecorationSet, EditorView, Decoration } from '@codemirror/view'
+import {
+  ViewPlugin,
+  Decoration,
+  type ViewUpdate,
+  type DecorationSet,
+  type EditorView
+} from '@codemirror/view'
 import { configField } from '../util/configuration'
 import { extractTextnodes, markdownToAST } from '@common/modules/markdown-utils'
 
@@ -236,7 +242,7 @@ function readabilityScores (view: EditorView): DecorationSet {
     decos = decos.concat(extractScores(text, from, readabilityAlgorithm))
   }
 
-  return Decoration.set(decos)
+  return Decoration.set(decos, true)
 }
 
 export const readabilityMode = ViewPlugin.fromClass(class {

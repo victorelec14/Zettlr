@@ -21,16 +21,19 @@ import { promises as fs, constants as FSConstants } from 'fs'
 import { FSALCodeFile, FSALFile } from '@providers/fsal'
 import ProviderContract from '@providers/provider-contract'
 import broadcastIpcMessage from '@common/util/broadcast-ipc-message'
-import AppServiceContainer from 'source/app/app-service-container'
+import type AppServiceContainer from 'source/app/app-service-container'
 import { ipcMain, app } from 'electron'
-import { DocumentTree, DTLeaf } from './document-tree'
+import { DocumentTree, type DTLeaf } from './document-tree'
 import PersistentDataContainer from '@common/modules/persistent-data-container'
-import { TabManager } from '@providers/documents/document-tree/tab-manager'
-import { DP_EVENTS, OpenDocument } from '@dts/common/documents'
+import { type TabManager } from '@providers/documents/document-tree/tab-manager'
+import { DP_EVENTS, type OpenDocument, DocumentType } from '@dts/common/documents'
 import { v4 as uuid4 } from 'uuid'
 import chokidar from 'chokidar'
-import countWords from '@common/util/count-words'
-import { DocumentAuthoritySingleton } from './document-authority'
+import { type Update } from '@codemirror/collab'
+import { ChangeSet, Text } from '@codemirror/state'
+import type { CodeFileDescriptor, MDFileDescriptor } from '@dts/common/fsal'
+import { countChars, countWords } from '@common/util/counter'
+import { markdownToAST } from '@common/modules/markdown-utils'
 
 type DocumentWindows = Record<string, DocumentTree>
 
@@ -715,10 +718,7 @@ export default class DocumentManager extends ProviderContract {
     await this.forEachLeaf(async (tabMan, windowId, leafId) => {
       const res = tabMan.replaceFilePath(oldPath, newPath)
       if (res) {
-        console.log('ADDING LEAF TO BE NOTIFIED')
         leafsToNotify.push([ windowId, leafId ])
-      } else {
-        console.log('Not adding leaf, nothing changed.')
       }
       return res
     })
@@ -727,7 +727,6 @@ export default class DocumentManager extends ProviderContract {
 
     // Emit the necessary events to each window
     for (const [ windowId, leafId ] of leafsToNotify) {
-      console.log('Emitting event for', windowId, leafId)
       this.broadcastEvent(DP_EVENTS.CLOSE_FILE, { filePath: oldPath, windowId, leafId })
       this.broadcastEvent(DP_EVENTS.OPEN_FILE, { filePath: newPath, windowId, leafId })
     }
@@ -746,7 +745,7 @@ export default class DocumentManager extends ProviderContract {
     const docs = this.documents.filter(doc => doc.filePath.startsWith(oldPath))
 
     for (const doc of docs) {
-      console.log('Replacing file path for doc', doc.filePath, 'with', doc.filePath.replace(oldPath, newPath))
+      this._app.log.info('Replacing file path for doc ' + doc.filePath + ' with ' + doc.filePath.replace(oldPath, newPath))
       await this.hasMovedFile(doc.filePath, doc.filePath.replace(oldPath, newPath))
     }
   }
@@ -1072,7 +1071,7 @@ export default class DocumentManager extends ProviderContract {
       return
     }
 
-    await leaf.tabMan.forward()
+    leaf.tabMan.forward()
     this.broadcastEvent(DP_EVENTS.OPEN_FILE, { windowId, leafId })
     this.broadcastEvent(DP_EVENTS.ACTIVE_FILE, { windowId, leafId })
   }
@@ -1083,7 +1082,7 @@ export default class DocumentManager extends ProviderContract {
       return
     }
 
-    await leaf.tabMan.back()
+    leaf.tabMan.back()
     this.broadcastEvent(DP_EVENTS.OPEN_FILE, { windowId, leafId })
     this.broadcastEvent(DP_EVENTS.ACTIVE_FILE, { windowId, leafId })
   }
@@ -1096,35 +1095,6 @@ export default class DocumentManager extends ProviderContract {
       return false
     }
 
-    this._ignoreChanges.push(filePath)
-
-    if (doc.descriptor.type === 'file') {
-      await FSALFile.save(
-        doc.descriptor,
-        doc.document.toString(),
-        this._app.fsal.getMarkdownFileParser(),
-        null
-      )
-      await this.synchronizeDatabases() // The file may have gotten a library
-
-      // In case of an MD File increase the word or char count
-      const content = doc.document.toString()
-      const newWordCount = countWords(content, false)
-      const newCharCount = countWords(content, true)
-
-      const countChars = this._app.config.get().editor.countChars
-      if (countChars) {
-        this._app.stats.updateWordCount(newCharCount - doc.lastSavedCharCount)
-      } else {
-        this._app.stats.updateWordCount(newWordCount - doc.lastSavedWordCount)
-      }
-
-      doc.lastSavedWordCount = newWordCount
-      doc.lastSavedCharCount = newCharCount
-    } else {
-      await FSALCodeFile.save(doc.descriptor, doc.document.toString(), null)
-    }
-
     // If saveFile was called from a timeout, clearTimeout does nothing but the
     // timeout is reset to undefined. However, implementing this check here
     // ensures that we can programmatically call saveFile anywhere else and
@@ -1134,9 +1104,46 @@ export default class DocumentManager extends ProviderContract {
       doc.saveTimeout = undefined
     }
 
+    // NOTE: Remember that we MUST under any circumstances adapt the document
+    // descriptor BEFORE attempting to save. The reason is that if we don't do
+    // that, we can run into the following race condition:
+    // 1. User changes the document
+    // 2. The save commences
+    // 3. The user adds more changes
+    // 4. The save finishes and undos the modifications
+    const content = doc.document.toString()
     doc.lastSavedVersion = doc.currentVersion
+
+    if (doc.descriptor.type === 'file') {
+      // In case of an MD File increase the word or char count
+      const ast = markdownToAST(content)
+      const newWordCount = countWords(ast)
+      const newCharCount = countChars(ast)
+
+      this._app.stats.updateWordCount(newWordCount - doc.lastSavedWordCount)
+      // TODO: Proper character counting
+
+      doc.lastSavedWordCount = newWordCount
+      doc.lastSavedCharCount = newCharCount
+    }
+
+    this._ignoreChanges.push(filePath)
+
+    if (doc.descriptor.type === 'file') {
+      await FSALFile.save(
+        doc.descriptor,
+        content,
+        this._app.fsal.getMarkdownFileParser(),
+        null
+      )
+      await this.synchronizeDatabases() // The file may have gotten a library
+    } else {
+      await FSALCodeFile.save(doc.descriptor, content, null)
+    }
+
     this._app.log.info(`[DocumentManager] File ${filePath} saved.`)
     this.broadcastEvent(DP_EVENTS.CHANGE_FILE_STATUS, { filePath, status: 'modification' })
+    this.broadcastEvent(DP_EVENTS.FILE_SAVED, { filePath })
 
     return true
   }

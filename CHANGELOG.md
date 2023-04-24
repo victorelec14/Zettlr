@@ -192,7 +192,13 @@ there.
   it on in the Spellchecker settings and even provide your LanguageTool username
   and an API key to unlock premium features
 - **New Feature**: You can now activate a statusbar that shows some context-
-  specific information for each editor pane you have open
+  specific information for each editor pane you have open; this statusbar also
+  shows you information for code editor panels, e.g., in the assets manager
+- **New Feature**: Changing a certain set of configuration options will make
+  Zettlr ask you whether you wish to restart the app for the changes to take
+  effect
+- **New Feature**: While modifying import and export profiles, Zettlr will now
+  check them for validity, and inform you of any potential errors
 - Replaced the old Markdown-to-HTML and HTML-to-Markdown converter with more up-
   to-date modules. This should not change how pasting from HTML or copying as
   HTML work, but it could.
@@ -277,12 +283,15 @@ there.
   in one app should be picked up by the other
 - Zettlr can now detect changes to the status of a directory as a git repository
   during runtime
+- The "Characters without spaces" info is no longer present in the toolbar
+  counter widget; the "characters" count now represents always the count without
+  spaces across the app
 
 ## Under the Hood
 
 - Refactored the main editor component further
 - Refactored the Sidebar panels into their own respective components
-- Upgrade Electron to `22.x.x`
+- Upgrade Electron to `24.x.x`
 - Upgrade Pandoc to `3.1.1`
 - Upgrade Chart.js to `4.x.x`
 - Upgrade CodeMirror to version 6

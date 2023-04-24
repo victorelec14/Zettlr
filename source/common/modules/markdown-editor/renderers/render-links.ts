@@ -13,9 +13,9 @@
  */
 
 import { renderInlineWidgets } from './base-renderer'
-import { SyntaxNodeRef, SyntaxNode } from '@lezer/common'
-import { EditorView, WidgetType } from '@codemirror/view'
-import { EditorState } from '@codemirror/state'
+import { type SyntaxNodeRef, type SyntaxNode } from '@lezer/common'
+import { WidgetType, type EditorView } from '@codemirror/view'
+import { type EditorState } from '@codemirror/state'
 import clickAndSelect from './click-and-select'
 import openMarkdownLink from '../util/open-markdown-link'
 import { linkImageMenu } from '../context-menu/link-image-menu'
@@ -64,7 +64,7 @@ class LinkWidget extends WidgetType {
       if (cmd || ctrl) {
         openMarkdownLink(this.linkUrl, view)
       } else {
-        clickAndSelect(view, this.node)(event)
+        clickAndSelect(view)(event)
       }
     })
 
@@ -151,13 +151,14 @@ function createWidget (state: EditorState, node: SyntaxNodeRef): LinkWidget|unde
     return new LinkWidget(url, url, node.node)
   }
 
-  const literalLink = state.sliceDoc(node.from, node.to)
-  const match = /(?!!)\[(?<title>.+)\]\((?<url>.+)\)/.exec(literalLink)
-  if (match === null) {
-    return undefined // Should not happen, but we never know.
+  const urlNode = node.node.getChild('URL')
+  if (urlNode === null) {
+    return undefined // This can happen for reference style links
   }
 
-  const { title, url } = match.groups as any
+  const titleNode = node.node.getChild('LinkLabel')
+  const url = state.sliceDoc(urlNode.from, urlNode.to)
+  const title = titleNode !== null ? state.sliceDoc(titleNode.from, titleNode.to) : url
 
   return new LinkWidget(title, url, node.node)
 }
